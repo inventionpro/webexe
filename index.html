@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>WebExe</title>
+  <style>
+    body {
+      display: flex;
+      flex-direction: column;
+      height: 90dvh;
+      color: #ddd;
+      background-color: #111;
+      box-sizing: border-box;
+    }
+    iframe {
+      flex: 1;
+      background-color: #ddd;
+    }
+  </style>
+  <script src="https://api.fsh.plus/file?url=https://raw.githubusercontent.com/Recoskie/core/refs/heads/master/x86/dis-x86.js"></script>
+</head>
+<body>
+  <input type="file" id="fileInput" accept=".exe">
+  <iframe></iframe>
+  <script>
+    const fileinp = document.getElementById('fileInput');
+    let iframe = document.querySelector('iframe');
+    function showMessage(txt) {
+      iframe.contentDocument.body.innerHTML = txt;
+    }
+
+    // Disassembler: Setup
+    core.bitMode = 2; // 64 bit
+    core.compatibilityMode(0); // Full x86
+    core.showInstructionHex = false; // Hide raw instrunctions
+    core.showInstructionPos = true; // Show positions
+    core.setBasePosition('0016:0000000000000000'); // Set pos to Code Segment 16 (os spoof?) and instruction 0 in 64 bit
+
+    // Arm and risc are not supported but added here for future
+    const arches = {
+      0x14c: 32,
+      0x200: 64,
+      0x8664: 64,
+      0x1c0: 32,
+      0xaa64: 64,
+      0x5032: 32,
+      0x5064: 64
+    };
+    const cpum = {
+      0x14c: 'intl',
+      0x200: 'intl',
+      0x8664: 'amd',
+      0x1c0: 'arm',
+      0xaa64: 'arm',
+      0x5032: 'risc',
+      0x5064: 'risc'
+    };
+    const debug = true;
+
+    function bytesToAscii(buffer, off, num) {
+      return new TextDecoder('ascii').decode(new Uint8Array(buffer, off, num)).replace(/\0+$/,'');
+    }
+    function runPE(data, off, buffer) {
+      let info = {};
+      off += 4; // COFF
+      info.arch = arches[data.getUint16(off, true)];
+      info.cpu = cpum[data.getUint16(off, true)];
+      if (info.cpu==='arm'||info.cpu==='risc') {
+        showMessage('Made for arm or risc which are not supported.');
+        return;
+      }
+      core.bitMode = info.arch===64?2:1; // Disassembler: Set 64 or 32 bit
+      core.setBasePosition('0016:'+(info.arch===64?'0000000000000000':'00000000')); // Disassembler: Set pos to Code Segment 16 (os spoof?) and instruction 0
+      info.sections = [];
+      info.sectionsnum = data.getUint16(off+2, true);
+      info.time = data.getUint32(off+4, true);
+      info.symboloff = data.getUint32(off+8, true);
+      info.symbolnum = data.getUint32(off+12, true);
+      info.ohsize = data.getUint16(off+16, true);
+      info.characteristic = data.getUint16(off+18, true);
+      off += 20; // Optional headers
+      // Ignore for now, not really necessary?
+      off += info.ohsize; // Section headers
+      for (let i = 0; i<info.sectionsnum; i++) {
+        info.sections.push({
+          name: bytesToAscii(buffer, off, 8),
+          vsize: data.getUint32(off+8),
+          vadd: data.getUint32(off+12),
+          rawsize: Math.min(data.getUint32(off+16), buffer.byteLength-data.getUint32(off+20)),
+          rawadd: data.getUint32(off+20),
+          relocadd: data.getUint32(off+24),
+          lineadd: data.getUint32(off+28),
+          relocnum: data.getUint16(off+32),
+          linenum: data.getUint16(off+34),
+          characteristics: data.getUint32(off+36)
+        });
+        if (info.sections.slice(-1)[0].rawsize<=0) {
+          console.log(info);
+          showMessage('Invalid size headers.');
+          return;
+        }
+        off += 40;
+      }
+      if (debug) showMessage(JSON.stringify(info, (_,v)=>typeof v==='bigint'?v.toString():v));
+      // Running sections
+      /*
+      .text code
+      .idata imports
+      .data .rdata .bss (vars, const, unnitialized)
+      - optional per exe
+      .reloc relocations
+      .rsrc gui assets and icons
+      .tls thread local storage
+      .edata export table
+      */
+     /*const textSection = info.sections.find(s => s.name.trim() === ".text");
+const codeBytes = new Uint8Array(buffer, textSection.rawadd, textSection.rawsize);
+
+// Example: find ASCII strings of 4+ printable chars
+function findAsciiStrings(bytes, minLen = 4) {
+  const strings = [];
+  let start = null;
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    if (b >= 32 && b <= 126) {
+      if (start === null) start = i;
+    } else {
+      if (start !== null && i - start >= minLen) {
+        strings.push({ start, end: i });
+      }
+      start = null;
+    }
+  }
+  // Handle string reaching the end
+  if (start !== null && bytes.length - start >= minLen) {
+    strings.push({ start, end: bytes.length });
+  }
+  return strings;
+}
+
+const dataRanges = findAsciiStrings(codeBytes);
+console.log(dataRanges);*/
+      // Dissasemble .text code
+      let codesec = info.sections.find(sec=>sec.name==='.text');
+      if (!codesec) {
+        if (debug) console.log(info);
+        showMessage('Your exe does not have the executable part (no .text).');
+        return;
+      }
+      let code = new Uint8Array(buffer, codesec.rawadd, codesec.rawsize);
+      code = Array.from(code,(byte)=>byte.toString(16).padStart(2,'0')).join(''); // Into byte string
+      // Disassembler: Decode
+      try {
+        core.loadBinCode(code)
+        code = core.disassemble();
+      } catch(err) {
+        if (debug) console.log(info, code, err);
+        showMessage('Failed to dissasemble .text code.');
+        return;
+      }
+      if (debug) showMessage(code);
+      // Run .text code
+    }
+    fileinp.onchange = (event)=>{
+      const file = event.target.files[0];
+      if (!file) return;
+
+      showMessage('Loading Chess Battle Advanced.');
+
+      const reader = new FileReader();
+      reader.onload = (evt)=>{
+        let data = new DataView(evt.target.result);
+        if (String.fromCharCode(data.getUint8(0))+String.fromCharCode(data.getUint8(1))!=='MZ') {
+          showMessage('Not an exe.');
+          return;
+        }
+        let off = data.getUint32(60, true);
+        let sig = String.fromCharCode(data.getUint8(off))+String.fromCharCode(data.getUint8(off+1))+String.fromCharCode(data.getUint8(off+2))+String.fromCharCode(data.getUint8(off+3));
+        if (debug) showMessage(`Offset: ${off} Signature: ${sig}`);
+        switch(sig) {
+          case 'PE\0\0':
+            runPE(data, off, evt.target.result);
+            break;
+          default:
+            showMessage(`Here be Dragons. Offset: ${off} Signature: ${sig} (Unknown)`);
+        }
+      };
+      reader.onprogress = (evt)=>{
+        showMessage(evt.loaded.toString()+'/'+evt.total.toString()+' Bytes');
+      };
+      reader.readAsArrayBuffer(file);
+    };
+  </script>
+</body>
+</html>
