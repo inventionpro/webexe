@@ -84,21 +84,16 @@
       for (let i = 0; i<info.sectionsnum; i++) {
         info.sections.push({
           name: bytesToAscii(buffer, off, 8),
-          vsize: data.getUint32(off+8),
-          vadd: data.getUint32(off+12),
-          rawsize: Math.min(data.getUint32(off+16), buffer.byteLength-data.getUint32(off+20)),
-          rawadd: data.getUint32(off+20),
-          relocadd: data.getUint32(off+24),
-          lineadd: data.getUint32(off+28),
-          relocnum: data.getUint16(off+32),
-          linenum: data.getUint16(off+34),
-          characteristics: data.getUint32(off+36)
+          vsize: data.getUint32(off+8, true),
+          vadd: data.getUint32(off+12, true),
+          rawsize: data.getUint32(off+16, true),
+          rawadd: data.getUint32(off+20, true),
+          relocadd: data.getUint32(off+24, true),
+          lineadd: data.getUint32(off+28, true),
+          relocnum: data.getUint16(off+32, true),
+          linenum: data.getUint16(off+34, true),
+          characteristics: data.getUint32(off+36, true)
         });
-        if (info.sections.slice(-1)[0].rawsize<=0) {
-          console.log(info);
-          showMessage('Invalid size headers.');
-          return;
-        }
         off += 40;
       }
       if (debug) showMessage(JSON.stringify(info, (_,v)=>typeof v==='bigint'?v.toString():v));
@@ -113,33 +108,6 @@
       .tls thread local storage
       .edata export table
       */
-     /*const textSection = info.sections.find(s => s.name.trim() === ".text");
-const codeBytes = new Uint8Array(buffer, textSection.rawadd, textSection.rawsize);
-
-// Example: find ASCII strings of 4+ printable chars
-function findAsciiStrings(bytes, minLen = 4) {
-  const strings = [];
-  let start = null;
-  for (let i = 0; i < bytes.length; i++) {
-    const b = bytes[i];
-    if (b >= 32 && b <= 126) {
-      if (start === null) start = i;
-    } else {
-      if (start !== null && i - start >= minLen) {
-        strings.push({ start, end: i });
-      }
-      start = null;
-    }
-  }
-  // Handle string reaching the end
-  if (start !== null && bytes.length - start >= minLen) {
-    strings.push({ start, end: bytes.length });
-  }
-  return strings;
-}
-
-const dataRanges = findAsciiStrings(codeBytes);
-console.log(dataRanges);*/
       // Dissasemble .text code
       let codesec = info.sections.find(sec=>sec.name==='.text');
       if (!codesec) {
@@ -158,7 +126,7 @@ console.log(dataRanges);*/
         showMessage('Failed to dissasemble .text code.');
         return;
       }
-      if (debug) showMessage(code);
+      if (debug) showMessage(code.replaceAll('\n','<br>'));
       // Run .text code
     }
     fileinp.onchange = (event)=>{
