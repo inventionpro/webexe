@@ -36,6 +36,208 @@
     core.showInstructionPos = true; // Show positions
     core.setBasePosition('0016:0000000000000000'); // Set pos to Code Segment 16 (os spoof?) and instruction 0 in 64 bit
 
+    // CPU
+    class CPU {
+      constructor(memsize = 0x20000, stackbase = 0x10000n) {
+        // 64-bit registers as BigInt
+        this.reg = {
+          RAX: 0n, RBX: 0n, RCX: 0n, RDX: 0n,
+          RSI: 0n, RDI: 0n, RBP: 0n, RSP: stackbase,
+          R8: 0n, R9: 0n, R10: 0n, R11: 0n, R12: 0n, R13: 0n, R14: 0n, R15: 0n,
+          RIP: 0n,
+        };
+        // EFLAGS placeholder
+        this.flags = {};
+        this.mem = new Uint8Array(memsize);
+        this.memBase = 0n;
+        this.addrToIndex = new Map();
+        this.instructions = [];
+        this.maxSteps = 10000;
+      }
+
+      // read/write memory little-endian
+      read64(addr) {
+        addr = Number(addr);
+        let v = 0n;
+        for (let i = 0; i < 8; i++) v |= BigInt(this.mem[addr + i]) << (8n * BigInt(i));
+        return v;
+      }
+      write64(addr, val) {
+        addr = Number(addr);
+        val = BigInt(val);
+        for (let i = 0; i < 8; i++) {
+          this.mem[addr + i] = Number((val >> (8n * BigInt(i))) & 0xFFn);
+        }
+      }
+      push64(val) {
+        this.reg.RSP -= 8n;
+        this.write64(this.reg.RSP, BigInt(val));
+      }
+      pop64() {
+        let v = this.read64(this.reg.RSP);
+        this.reg.RSP += 8n;
+        return v;
+      }
+
+      // Register get/set for sub-registers like AL, R9B
+      getRegValue(name) {
+        name = name.toUpperCase();
+        if (name === 'AL') return this.reg.RAX & 0xFFn;
+        if (name.endsWith('B') && name.length === 3 && name[0] === 'R' && !isNaN(Number(name[1]))) {
+          // R8B..R15B style
+          let r = name.slice(0, -1); // R9
+          return this.reg[r] & 0xFFn;
+        }
+        // full 64-bit registers (RAX, R9, etc.)
+        if (this.reg[name] !== undefined) return this.reg[name];
+        throw new Error('Unknown register: '+name);
+      }
+      setRegValue(name, value) {
+        name = name.toUpperCase();
+        value = BigInt(value);
+        if (name === 'AL') {
+          // clear low 8 bits, set new low 8 bits
+          this.reg.RAX = (this.reg.RAX & ~0xFFn) | (value & 0xFFn);
+          return;
+        }
+        if (name.endsWith('B') && name.length === 3 && name[0] === 'R' && !isNaN(Number(name[1]))) {
+          let r = name.slice(0, -1);
+          this.reg[r] = (this.reg[r] & ~0xFFn) | (value & 0xFFn);
+          return;
+        }
+        if (this.reg[name] !== undefined) {
+          this.reg[name] = value & ((1n << 64n) - 1n);
+          return;
+        }
+        throw new Error('Unknown register to set: '+name);
+      }
+
+      // Numeric hex to BigInt
+      parseHexImm(s) {
+        s = s.replace(/^0+/, '')||'0';
+        return BigInt('0x' + s);
+      }
+
+      // Memory operand ([RSP+30] or [00...0030]) to numeric address BigInt
+      resolveMemOperand(op) {
+        let inner = op.replace(/^\[|\]$/g, '').trim();
+        // If absolute hex just return
+        if (/^[0-9A-Fa-f]+$/.test(inner)) return BigInt('0x' + inner);
+        // REG+OFFSET
+        const m = inner.match(/^([A-Za-z0-9]+)(?:\+([0-9A-Fa-f]+))?$/);
+        if (!m) throw new Error('Unsupported mem operand: '+op);
+        const base = m[1].toUpperCase();
+        const offset = m[2]?this.parseHexImm(m[2]):0n;
+        if (this.reg[base] === undefined) throw new Error('Unknown base reg: '+base);
+        return this.reg[base] + offset;
+      }
+
+      // Add instructions
+      loadInstructions(instrs) {
+        this.instructions = instrs;
+        this.addrToIndex.clear();
+        for (let i = 0; i < instrs.length; i++) {
+          this.addrToIndex.set(instrs[i].addr, i);
+        }
+      }
+
+      // Execute from address (BigInt)
+      run(startAddrHex) {
+        this.reg.RIP = this.parseHexImm(startAddrHex);
+        let steps = 0;
+        while (steps++ < this.maxSteps) {
+          let rip = this.reg.RIP;
+          let ripStr = rip.toString(16).padStart(16, '0');
+          let idx = this.addrToIndex.get(ripStr);
+          if (idx === undefined) {
+            console.log(`RIP ${ripStr} not found in instructions.`);
+            break;
+          }
+          let ins = this.instructions[idx];
+          // Move RIP to next instruction
+          let nextAddr = this.parseHexImm(ins.nextAddrHex||ins.addr);
+          this.reg.RIP = this.parseHexImm(ins.nextAddrHex);
+
+          // Dispatch
+          let mnem = ins.mnemonic.toUpperCase();
+          let ops = ins.operands.map(o => o.trim());
+          // console.log(`@${ins.addr} ${mnem} ${ops.join(', ')}`);
+          try {
+            if (mnem === 'NOP') {
+              // No operation
+            } else if (mnem === 'SUB' || mnem === 'ADD') {
+              let dest = ops[0].toUpperCase();
+              let imm = this.parseHexImm(ops[1]);
+              let cur = this.getRegValue(dest);
+              let res = mnem === 'SUB' ? cur - imm : cur + imm;
+              this.setRegValue(dest, res);
+            } else if (mnem === 'MOV') {
+              let dst = ops[0];
+              let src = ops[1];
+              if (/^QWORD PTR\s*\[.*\]$/i.test(dst)) {
+                // mem <- reg
+                let memAddr = this.resolveMemOperand(dst.replace(/^QWORD PTR\s*/i, ''));
+                let val = this.getRegValue(src);
+                this.write64(memAddr, val);
+              } else if (/^QWORD PTR\s*\[.*\]$/i.test(src)) {
+                // reg <- mem (64-bit)
+                let memAddr = this.resolveMemOperand(src.replace(/^QWORD PTR\s*/i, ''));
+                let val = this.read64(memAddr);
+                this.setRegValue(dst, val);
+              } else {
+                // reg <- reg/imm/reg8 etc
+                // If src looks like hex immediate:
+                if (/^[0-9A-Fa-f]+$/.test(src)) {
+                  this.setRegValue(dst, this.parseHexImm(src));
+                } else {
+                  let val = this.getRegValue(src);
+                  this.setRegValue(dst, val);
+                }
+              }
+            } else if (mnem === 'LEA') {
+              // LEA RCX,[RSP+30] => RCX := address
+              let dst = ops[0];
+              let memop = ops[1];
+              let addr = this.resolveMemOperand(memop);
+              this.setRegValue(dst, addr);
+            } else if (mnem === 'CALL') {
+              // CALL <hex address>
+              let target = ops[0];
+              let targetAddr = this.parseHexImm(target);
+              // Push return address
+              this.push64(this.reg.RIP);
+              let targetStr = targetAddr.toString(16).padStart(16,'0');
+              if (this.addrToIndex.has(targetStr)) {
+                this.reg.RIP = targetAddr;
+              } else {
+                // TODO: External calls in CALL
+                console.log(`External call ${targetStr} - stub`);
+                this.reg.RAX = 0n; // Set RAX=0 as stub return
+                let ret = this.pop64(); // Immediate RET: pop rip
+                this.reg.RIP = ret;
+              }
+            } else if (mnem === 'RET') {
+              const retAddr = this.pop64();
+              this.reg.RIP = retAddr;
+            } else if (mnem === 'INT') {
+              // INT -> breakpoint
+              // Kinda ignore, no breakpoints anyway
+              console.log('INT (breakpoint) hit at', ins.addr);
+              break;
+            } else {
+              console.log('Unhandled mnemonic:', mnem, 'at', ins.addr);
+              break;
+            }
+          } catch(err) {
+            console.error('Error while running:', err);
+            break;
+          }
+        }
+        console.log('Stopped after '+steps+'steps');
+        return this;
+      }
+    }
+
     // Arm and risc are not supported but added here for future
     const arches = {
       0x14c: 32,
@@ -126,8 +328,43 @@
         showMessage('Failed to dissasemble .text code.');
         return;
       }
-      if (debug) showMessage(code.replaceAll('\n','<br>'));
+      if (debug) console.log(code); // Too big for display if file over 100kb
       // Run .text code
+      let cpu = new CPU(0x20000, 0x10000n);
+
+      let instrs = code
+        .split(/\r?\n/)
+        .map(l=>l.trim())
+        .filter(l=>l.length)
+        .map(line=>{
+          let m = line.match(/^([0-9A-Fa-f]{8,16})\s+([A-Z]+)\s*(.*)$/i);
+          if (!m) return null;
+          let addr = m[1].toLowerCase().padStart(16,'0');
+          let mnemonic = m[2];
+          let rest = m[3].trim();
+          let operands = [];
+          if (rest.length) {
+            // Split by comma but allow commas inside brackets
+            operands = rest.split(/\s*,\s*/);
+          }
+          return {
+            addr,
+            mnemonic,
+            operands,
+            raw: line
+          };
+        })
+        .filter(l=>typeof l!=='undefined');
+      // Compute next address
+      for (let i = 0; i < instrs.length; i++) {
+        const next = (i+1 < instrs.length)?instrs[i+1].addr:null;
+        instrs[i].nextAddrHex = next||instrs[i].addr; // If last, stays same
+      }
+
+      cpu.loadInstructions(instrs);
+      cpu.run('0000000000000000');
+
+      console.log(cpu)
     }
     fileinp.onchange = (event)=>{
       const file = event.target.files[0];
